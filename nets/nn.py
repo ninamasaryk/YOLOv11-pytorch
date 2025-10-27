@@ -347,6 +347,8 @@ class YOLO(torch.nn.Module):
 
 
     def forward(self, x):
+        for i, t in enumerate(x):
+            print(f"  tensor[{i}].shape = {list(t.shape)}") 
         x = self.backbone(x)
         x = self.head(x)
         return self.detect(list(x))
@@ -360,38 +362,38 @@ class YOLO(torch.nn.Module):
         return self
 
 
-def yolo_v11_n(num_cls=80):
+def yolo_v11_n(num_cls=80, num_channels=3):
     csp = [False, True]
     depth = [1, 1, 1, 1, 1]
-    width = [3, 16, 32, 64, 128, 256]
+    width = [num_channels, 16, 32, 64, 128, 256]
     return YOLO(num_cls, width, depth, csp)
 
 
-def yolo_v11_s(num_cls=80):
+def yolo_v11_s(num_cls=80, num_channels=3):
     csp = [False, True]
     depth = [1, 1, 1, 1, 1]
-    width = [3, 32, 64, 128, 256, 512]
+    width = [num_channels, 32, 64, 128, 256, 512]
 
     return YOLO(num_cls, width, depth, csp)
 
 
-def yolo_v11_m(num_cls=80):
+def yolo_v11_m(num_cls=80, num_channels=3):
     csp = [True, True]
     depth = [1, 1, 1, 1, 1]
-    width = [3, 64, 128, 256, 512, 512]
+    width = [num_channels, 64, 128, 256, 512, 512]
 
     return YOLO(num_cls, width, depth, csp)
 
 
-def yolo_v11_l(num_cls=80):
+def yolo_v11_l(num_cls=80, num_channels=3):
     csp = [True, True]
     depth = [2, 2, 2, 2, 2]
-    width = [3, 64, 128, 256, 512, 512]
+    width = [num_channels, 64, 128, 256, 512, 512]
     return YOLO(num_cls, width, depth, csp)
 
 
-def yolo_v11_x(num_cls=80):
+def yolo_v11_x(num_cls=80, num_channels=3):
     csp = [True, True]
     depth = [2, 2, 2, 2, 2]
-    width = [3, 96, 192, 384, 768, 768]
+    width = [num_channels, 96, 192, 384, 768, 768]
     return YOLO(num_cls, width, depth, csp)

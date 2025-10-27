@@ -5,6 +5,9 @@ import numpy as np
 import albumentations as album
 
 import torch
+
+from PIL import Image
+from skimage.transform import resize as sk_resize
 from ultralytics.utils.instance import Instances
 
 
@@ -145,6 +148,7 @@ class RandomPerspective:
 
         matrix = translate @ shear @ rotate @ pers @ center
 
+        #TODO: refactor to work with more channels
         if (border[0] != 0) or (border[1] != 0) or (matrix != np.eye(3)).any():
             if _pers:
                 img = cv2.warpPerspective(img, matrix, dsize=self.size,
@@ -257,15 +261,26 @@ class LetterBox:
             dh /= 2
 
         if shape[::-1] != new_unpad:  # resize
-            img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+            img = sk_resize(img, new_unpad, order=1, preserve_range=True, anti_aliasing=True).astype(img.dtype)
+       
+
+            
         top, bottom = int(round(dh - 0.1)) if self.center else 0, int(
             round(dh + 0.1))
         left, right = int(round(dw - 0.1)) if self.center else 0, int(
             round(dw + 0.1))
-        img = cv2.copyMakeBorder(
-            img, top, bottom, left, right, cv2.BORDER_CONSTANT,
-            value=(114, 114, 114)
-        )  # add border
+        if img.shape[2] == 3:
+            img = cv2.copyMakeBorder(
+                img, top, bottom, left, right, cv2.BORDER_CONSTANT,
+                value=(114, 114, 114)
+            )  # add border
+        else:
+            border_value = tuple([114] * img.shape[-1])  # Create border value for all channels
+            padded_shape = (img.shape[0] + top + bottom, img.shape[1] + left + right) + img.shape[2:]
+            padded_img = np.full(padded_shape, border_value[0], dtype=img.dtype)
+            padded_img[top:top+img.shape[0], left:left+img.shape[1]] = img
+            img = padded_img
+
         if labels.get("pad"):
             labels["pad"] = (
                 labels["pad"], (left, top))  # for evaluation
@@ -320,7 +335,11 @@ class RandomHSV:
         img = labels["img"]
         if self.h or self.s or self.v:
             r = np.random.uniform(-1, 1, 3) * [self.h, self.s, self.v] + 1
-            hue, sat, val = cv2.split(cv2.cvtColor(img, cv2.COLOR_BGR2HSV))
+            if img.shape[2] == 3:
+                hue, sat, val = cv2.split(cv2.cvtColor(img, cv2.COLOR_BGR2HSV))
+            else:
+                hue, sat, val = cv2.split(
+                    cv2.cvtColor(img[:,:,:3], cv2.COLOR_RGB2HSV))
             dtype = img.dtype
 
             x = np.arange(0, 256, dtype=r.dtype)
@@ -330,7 +349,20 @@ class RandomHSV:
 
             im_hsv = cv2.merge((cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat),
                                 cv2.LUT(val, lut_val)))
-            cv2.cvtColor(im_hsv, cv2.COLOR_HSV2BGR, dst=img)
+            
+            # Convert back to BGR/RGB into a temporary array and assign to img to avoid dst layout errors
+            if img.shape[2] == 3:
+                converted = cv2.cvtColor(im_hsv, cv2.COLOR_HSV2BGR)
+                if converted.dtype != img.dtype:
+                    converted = converted.astype(img.dtype)
+                img[:] = converted
+            else:
+                converted = cv2.cvtColor(im_hsv, cv2.COLOR_HSV2RGB)
+                if converted.dtype != img.dtype:
+                    converted = converted.astype(img.dtype)
+                img[:, :, :3] = converted
+
+            Image.fromarray(img[:, :, :3]).show()
         return labels
 
 

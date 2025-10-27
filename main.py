@@ -20,9 +20,49 @@ from utils.dataset import Dataset
 
 def train(args, params):
     util.init_seeds()
+    model = nn.yolo_v11_x(args.num_cls, params['num_channels'])
 
-    model = nn.yolo_v11_x(args.num_cls)
-    model.cuda()
+    ckpt = torch.load('yolo11x_remapped.pt', map_location='cpu')
+    state_dict = ckpt['model']
+    
+    # Keep only keys that match name AND shape
+    filtered_state = {}
+    for k, v in state_dict.items():
+        if k in model.state_dict():
+            if v.shape == model.state_dict()[k].shape:
+                filtered_state[k] = v
+            else:
+                print(f"⚠️ Skipping {k}: shape mismatch {v.shape} vs {model.state_dict()[k].shape}")
+        else:
+            print(f"❌ Skipping {k}: not in current model")
+
+    # Update only the compatible parameters
+    model.state_dict().update(filtered_state)
+    model.load_state_dict(model.state_dict())
+    print(f"✅ Loaded {len(filtered_state)} / {len(model.state_dict())} compatible layers")
+
+    with torch.no_grad():
+        w = state_dict["backbone.p1.0.conv.weight"]  # old input conv weights
+        new_w = model.state_dict()["backbone.p1.0.conv.weight"]   # new shape (out, 33, h, w)
+
+        # e.g., repeat RGB weights across 33 channels
+        repeat_factor = new_w.shape[1] // w.shape[1]
+        new_w[:, :w.shape[1]*repeat_factor] = w.repeat(1, repeat_factor, 1, 1)
+        model.state_dict()["backbone.p1.0.conv.weight"] = new_w
+
+
+
+    # ckpt = torch.load('yolo11x_pretrained.pt', map_location='cpu')
+    # keys_pretr = ckpt['model'].state_dict().keys()
+    # keys_new = model.state_dict().keys()
+    # mapping = dict(zip(keys_pretr, keys_new))
+    # state_dict = ckpt["model"].state_dict()
+    # new_state_dict = {mapping.get(k, k): v for k, v in state_dict.items()}
+    # model.load_state_dict(new_state_dict, strict=False)
+    # torch.save({"model": new_state_dict}, "yolo11_remapped.pt")
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
 
     if args.distributed:
         util.setup_ddp(args)
@@ -30,7 +70,8 @@ def train(args, params):
     # Freeze DFL Layer
     util.freeze_layer(model)
 
-    scaler = torch.amp.GradScaler(device='cuda', enabled=True)
+
+    scaler = torch.amp.GradScaler(device=device, enabled=True)
     # DDP setup
     if args.distributed:
         model = DistributedDataParallel(module=model,
@@ -100,8 +141,10 @@ def train(args, params):
                         if "momentum" in x:
                             x["momentum"] = np.interp(glob_step, xi, [0.8, 0.937])
 
-                images = batch["img"].cuda().float() / 255
-                with torch.amp.autocast("cuda"):
+                
+                images = batch["img"].to(device).float() / 255
+                # Use autocast only when CUDA is available; when disabled it's a no-op
+                with torch.amp.autocast(device_type=device.type, enabled=(device.type == 'cuda')):
                     pred = model(images)
                     loss, loss_items = criterion(pred, batch)
                     if args.distributed:
@@ -123,7 +166,10 @@ def train(args, params):
 
                 if args.rank == 0:
                     fmt = "%11s" * 2 + "%11.4g" * 3
-                    memory = f'{torch.cuda.memory_reserved() / 1e9:.3g}G'
+                    if torch.cuda.is_available():
+                        memory = f'{torch.cuda.memory_reserved() / 1e9:.3g}G'
+                    else:
+                        memory = '0G'  # or 'CPU' if you prefer
                     p_bar.set_description(fmt % (f"{epoch + 1}/{args.epochs}", memory, *t_loss))
 
             if args.rank == 0:
@@ -159,6 +205,8 @@ def train(args, params):
 
 
 def validate(args, params, model=None):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     iou_v = torch.linspace(0.5, 0.95, 10)
     n_iou = iou_v.numel()
 
@@ -166,7 +214,7 @@ def validate(args, params, model=None):
 
     if not model:
         args.plot = True
-        model = torch.load(f='weights/best.pt', map_location='cuda')
+        model = torch.load(f='weights/best.pt', map_location=device)
         model = model['model'].float().fuse()
 
     # model.half()
@@ -178,9 +226,9 @@ def validate(args, params, model=None):
 
     for batch in tqdm.tqdm(loader, desc=('%10s' * 5) % (
     '', 'precision', 'recall', 'mAP50', 'mAP')):
-        image = (batch["img"].cuda().float()) / 255
+        image = (batch["img"].to(device).float()) / 255
         for k in ["idx", "cls", "box"]:
-            batch[k] = batch[k].cuda()
+            batch[k] = batch[k].to(device)
 
         outputs = util.non_max_suppression(model(image))
 
@@ -211,10 +259,11 @@ def validate(args, params, model=None):
 
 @torch.no_grad()
 def inference(args, params):
-    model = torch.load('./weights/v11_m.pt', 'cuda')['model'].float()
+    #TODO: refactor to work with input with more channels and actual input
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = torch.load('./weights/v11_m.pt', device)['model'].float()
     model.half()
     model.eval()
-
     camera = cv2.VideoCapture('2.mp4')
 
     # Get video properties
@@ -258,7 +307,7 @@ def inference(args, params):
             x = np.ascontiguousarray(x)
             x = torch.from_numpy(x)
             x = x.unsqueeze(dim=0)
-            x = x.cuda()
+            x = x.to(device)
             x = x.half()
             x = x / 255
             # Inference
@@ -298,10 +347,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--rank', default=0, type=int)
     parser.add_argument('--epochs', default=2, type=int)
-    parser.add_argument('--num-cls', type=int, default=80)
+    parser.add_argument('--num-cls', type=int, default=1)
     parser.add_argument('--inp-size', type=int, default=640)
-    parser.add_argument('--batch-size', type=int, default=64)
-    parser.add_argument('--data-dir', type=str, default='COCO')
+    parser.add_argument('--batch-size', type=int, default=2)
+    parser.add_argument('--data-dir', type=str, default='/Users/ninamasarykova/Documents/FIIT_STU/DizP/CooperativePerception/dataset_rgb')
     parser.add_argument('--plot', action='store_true')
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--validate', action='store_true')
@@ -315,6 +364,7 @@ def main():
 
     with open('utils/args.yaml', errors='ignore') as f:
         params = yaml.safe_load(f)
+
 
     if args.train:
         train(args, params)

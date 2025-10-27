@@ -3,6 +3,7 @@ import cv2
 import math
 import torch
 import numpy as np
+import tifffile
 from PIL import Image
 from pathlib import Path
 from utils import augment
@@ -10,6 +11,8 @@ from copy import deepcopy
 from torch.utils import data
 
 from ultralytics.utils.instance import Instances
+from skimage.transform import resize as sk_resize
+
 
 img_ext = {"bmp", "jpeg", "jpg", "png", "tif", "tiff"}
 
@@ -20,14 +23,20 @@ class Dataset(data.Dataset):
         self.args = args
         self.params = params
         self.augment = augments
-        self.mosaic = augments
+        self.mosaic = params['mosaic']
 
+        #TODO: fix proper train val split and filenames
+        self.mode = 'train' if self.augment else 'val'
         file = 'train2017.txt' if self.augment else 'val2017.txt'
-        filenames = f'{args.data_dir}/{file}'
-        self.images = self.load_image(filenames)
+        # filenames = f'{args.data_dir}/{file}'
+        filenames = os.listdir(f"{args.data_dir}/images/{self.mode}/")
+        filenames = [os.path.join(f"{args.data_dir}/images/{self.mode}/", f) for f in filenames]
+        self.images = self.load_image(filenames, from_txt=False)
+        print(len(self.images), "images found")
         self.labels = self.load_labels(args, self.images)["labels"]
 
         self.num_img = len(self.labels)
+        print(self.num_img, "images found for %s" % self.mode)
         self.indices = np.arange(self.num_img)
         self.transforms = self.build_transforms()
 
@@ -52,6 +61,7 @@ class Dataset(data.Dataset):
             self.batch_shapes = np.ceil(
                 np.array(shapes) * self.args.inp_size / 32 + 0.5)
             self.batch_shapes = self.batch_shapes.astype(int) * 32
+
             self.batch = bi
 
     def __getitem__(self, index):
@@ -62,26 +72,42 @@ class Dataset(data.Dataset):
         return len(self.labels)
 
     @staticmethod
-    def load_image(path):
+    def load_image(path, from_txt=True):
         samples = []
-        for p in [path]:
-            p = Path(p)
-            with open(p) as f:
-                samples += [x.replace("./", str(p.parent) + os.sep)
-                            if x.startswith("./") else x for x in
-                            f.read().strip().splitlines()]
 
-        return sorted(x.replace("/", os.sep) for x in samples if
-                      x.split(".")[-1].lower() in img_ext)
+        if from_txt:
+            for p in [path]:
+                p = Path(p)
+                with open(p) as f:
+                    samples += [x.replace("./", str(p.parent) + os.sep)
+                                if x.startswith("./") else x for x in
+                                f.read().strip().splitlines()]
+
+            return sorted(x.replace("/", os.sep) for x in samples if
+                        x.split(".")[-1].lower() in img_ext)
+        else:
+            return path
 
     def read_image(self, index):
-        image = cv2.imread(self.images[index])
-        h0, w0 = image.shape[:2]
+        if self.images[index].lower().endswith(('.tif', '.tiff')):
+            image = tifffile.imread(self.images[index])
+            h0, w0 = image.shape[:2]
+        else:
+            image = cv2.imread(self.images[index])
+            h0, w0 = image.shape[:2]
         r = self.args.inp_size / max(h0, w0)
         if r != 1:
             w, h = (min(math.ceil(w0 * r), self.args.inp_size),
                     min(math.ceil(h0 * r), self.args.inp_size))
-            image = cv2.resize(image, (w, h), interpolation=cv2.INTER_LINEAR)
+            if self.images[index].lower().endswith(('.tif', '.tiff')):
+                if image.ndim == 2:
+                    target_shape = (h, w)
+                else:
+                    target_shape = (h, w, image.shape[2])
+                image = sk_resize(image, target_shape, order=1, preserve_range=True, anti_aliasing=True).astype(image.dtype)
+            else:
+                image = cv2.resize(image, (w, h), interpolation=cv2.INTER_LINEAR)
+
         return image, (h0, w0), image.shape[:2]
 
     @staticmethod
@@ -89,22 +115,29 @@ class Dataset(data.Dataset):
         cache = {"labels": []}
         a = f"{os.sep}images{os.sep}"
         b = f"{os.sep}labels{os.sep}"
-        labels = [b.join(x.rsplit(a, 1)).rsplit(".", 1)[0] + ".txt" for x in
-                  images]
 
+        labels = [x.replace(a, b).rsplit(".", 1)[0] + ".txt" for x in images]
+        
         path = Path(labels[0]).parent.with_suffix(".cache")
         if os.path.exists(path):
             return torch.load(path)
 
         for img, label in zip(images, labels):
             try:
-                image = Image.open(img)
-                image.verify()
-                shape = image.size
-                shape = (shape[1], shape[0])
-                assert (shape[0] > 9) & (
-                        shape[1] > 9), f"image size {shape} <10 pixels"
-                assert image.format.lower() in img_ext, f"invalid image format"
+                if img.lower().endswith(('.tif', '.tiff')):
+                    image = tifffile.imread(img)
+                    shape = image.shape[:2]
+                    
+                    assert (shape[0] > 9) & (
+                            shape[1] > 9), f"image size {shape} <10 pixels"
+                else:
+                    image = Image.open(img)
+                    image.verify()
+                    shape = image.size
+                    shape = (shape[1], shape[0])
+                    assert (shape[0] > 9) & (
+                            shape[1] > 9), f"image size {shape} <10 pixels"
+                    assert image.format.lower() in img_ext, f"invalid image format"
 
                 if os.path.isfile(label):
                     with open(label) as f:

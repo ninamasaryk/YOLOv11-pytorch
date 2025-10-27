@@ -17,15 +17,17 @@ def init_seeds(seed=0):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
     torch.use_deterministic_algorithms(False)
     torch.backends.cudnn.deterministic = False
 
 
 def setup_ddp(args):
     from datetime import timedelta
-    torch.cuda.set_device(args.rank)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(args.rank)
     os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"
     torch.distributed.init_process_group(
         backend="nccl" if torch.distributed.is_nccl_available() else "gloo",
@@ -318,7 +320,7 @@ class DetectionLoss:
         self.no = m.nc + m.reg_max * 4
 
         self.assigner = Assigner(nc=self.nc)
-        self.bbox_loss = BoxLoss(m.reg_max).cuda()
+        self.bbox_loss = BoxLoss(m.reg_max).to(device)
         self.bce = nn.BCEWithLogitsLoss(reduction="none")
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
@@ -534,9 +536,10 @@ def compute_ap(tp, conf, pred, target, plot=False, on_plot=None,
 
 # ----------------------------- Metrics & Plotting Start -----
 def update_metrics(preds, batch, niou, iou_v, stats):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     for i, pred in enumerate(preds):
-        stat = dict(conf=torch.zeros(0).cuda(), pred_cls=torch.zeros(0).cuda(),
-                    tp=torch.zeros(len(pred), niou, dtype=torch.bool).cuda())
+        stat = dict(conf=torch.zeros(0).to(device), pred_cls=torch.zeros(0).to(device),
+                    tp=torch.zeros(len(pred), niou, dtype=torch.bool).to(device))
 
         idx = batch["idx"] == i
         box = batch["box"][idx]
@@ -545,7 +548,7 @@ def update_metrics(preds, batch, niou, iou_v, stats):
 
         if len(cls):
             img_shape = batch["img"].shape[2:]
-            tensor = torch.tensor(img_shape).cuda()[[1, 0, 1, 0]]
+            tensor = torch.tensor(img_shape).to(device)[[1, 0, 1, 0]]
             box = wh2xy(box) * tensor
             scale_boxes(box, batch["shape"][i], batch["pad"][i])
 
@@ -583,8 +586,9 @@ def box_iou(box1, box2, eps=1e-7):
 
 
 def scale_boxes(boxes, shape, r_pad):
+    device = 'cuda' if boxes.is_cuda else 'cpu'
     gain, pad = r_pad[0][0], r_pad[1]
-    boxes[..., :4] -= torch.tensor([pad[0], pad[1], pad[0], pad[1]]).cuda()
+    boxes[..., :4] -= torch.tensor([pad[0], pad[1], pad[0], pad[1]]).to(device)
     boxes[..., :4] /= gain
 
     boxes[..., [0, 2]] = boxes[..., [0, 2]].clamp(0, shape[1])
@@ -683,6 +687,8 @@ class Colors:
     def hex2rgb(h):
         return tuple(int(h[1 + i:1 + i + 2], 16) for i in (0, 2, 4))
 
+
+#TODO: refactor this function to work with more channels 
 def draw_box(im, box, index, label=""):
     import cv2
     color = Colors()(index, True)
