@@ -305,7 +305,7 @@ class Assigner(nn.Module):
         pos_overlaps = (overlaps * mask_pos).amax(dim=-1, keepdim=True)
         norm_metric = (metric * pos_overlaps / (pos_metrics + self.eps))
         target_scores = target_scores * (norm_metric.amax(-2).unsqueeze(-1))
-        return target_bboxes, target_scores, fg_mask.bool()
+        return target_bboxes, target_scores, fg_mask.bool(), gt_idx
 
 
 class DetectionLoss:
@@ -318,6 +318,10 @@ class DetectionLoss:
         self.stride = m.stride
         self.reg_max = m.reg_max
         self.no = m.nc + m.reg_max * 4
+
+        self.enable_redundancy = model.params.redundancy
+        if self.enable_redundancy:
+            self.no += 1
 
         self.assigner = Assigner(nc=self.nc)
         self.bbox_loss = BoxLoss(m.reg_max).to(device)
@@ -354,10 +358,18 @@ class DetectionLoss:
         feats = pred[1] if isinstance(pred, tuple) else pred
         x = torch.cat([f.view(feats[0].shape[0], self.no, -1) for f in feats],
                       2)
-        pred_distri, pred_scores = x.split((self.reg_max * 4, self.nc), 1)
+        
+        if self.enable_redundancy:
+            pred_distri, pred_scores, pred_redundant = x.split((self.reg_max * 4, self.nc, 1), 1)
+        else:
+            pred_distri, pred_scores = x.split((self.reg_max * 4, self.nc), 1)
+            pred_redundant = None
 
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
         pred_distri = pred_distri.permute(0, 2, 1).contiguous()
+
+        if self.enable_redundancy:
+            pred_redundant = pred_redundant.permute(0, 2, 1).contiguous()
 
         dtype, bs = pred_scores.dtype, pred_scores.shape[0]
         img_size = torch.tensor(feats[0].shape[2:], device=self.device,
@@ -374,13 +386,46 @@ class DetectionLoss:
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
 
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
-        target_bboxes, target_scores, fg_mask = self.assigner(
+        target_bboxes, target_scores, fg_mask, matched_gt_idx = self.assigner(
             pred_scores.detach().sigmoid(),
             (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
             anchor_points * stride_tensor, gt_labels, gt_bboxes, mask_gt)
 
         _loss = self.bce(pred_scores, target_scores.to(dtype))
         loss[1] = _loss.sum() / max(target_scores.sum(), 1)
+
+        redund_loss = torch.tensor(0.0, device=self.device)
+        if self.enable_redundancy and "redundant" in batch:
+            # target_redundant = batch["redundant"].to(self.device).float()
+            # # Match shape: (bs, num_anchors)
+            # if target_redundant.ndim == 2:
+            #     target_redundant = target_redundant.unsqueeze(-1)
+            # redund_loss_tensor = self.bce(pred_redundant, target_redundant)
+            # redund_loss = redund_loss_tensor.mean()
+            idx = batch["idx"]
+            gt_redund = batch["redundant"].to(self.device).float()  # [bs, n_max_gt, 1]
+            gt_redund = gt_redund.squeeze(-1)
+            bs, num_anchors, _ = pred_redundant.shape
+
+            target_redundant = torch.zeros_like(pred_redundant)
+
+            for b in range(bs):
+                pos_mask = fg_mask[b] > 0
+                if not pos_mask.any():
+                    continue
+
+                assigned_gt = matched_gt_idx[b][pos_mask]
+                img_mask = idx == b
+                gt_redund_img = gt_redund[img_mask]
+
+                valid = assigned_gt < gt_redund_img.shape[0]
+                if valid.any():
+                    target_redundant[b, pos_mask.nonzero(as_tuple=True)[0][valid], 0] = gt_redund_img[assigned_gt[valid]]
+
+            # ✅ compute loss only on positive anchors (objects)
+            redund_loss = self.bce(pred_redundant[fg_mask], target_redundant[fg_mask]).mean()
+        
+        
 
         # Bbox loss
         if fg_mask.sum():
@@ -396,44 +441,75 @@ class DetectionLoss:
         loss[0] *= 7.5
         loss[1] *= 0.5
         loss[2] *= 1.5
-        return loss.sum() * bs, loss.detach()
+
+        if self.enable_redundancy:
+            total_loss = (loss.sum() + redund_loss) * bs
+            loss_out = torch.cat((loss.detach(), redund_loss.detach().unsqueeze(0)))
+            return total_loss, loss_out
+        else:
+            return loss.sum() * bs, loss.detach()
+
+
+       
 
 
 # ----------------------- Detection Loss End --------------
 
 # ----------------------- Compute AP Start -----------------
-def non_max_suppression(pred, conf_th=0.001, iou_th=0.7):
+def non_max_suppression(pred, conf_th=0.001, iou_th=0.7, redundancy = False):
     import torchvision
     max_det = 300
     max_wh = 7680
     max_nms = 30000
 
     pred = pred[0] if isinstance(pred, (list, tuple)) else pred
-
     bs = pred.shape[0]  # batch size
-    nc = pred.shape[1] - 4  # number of classes
-    xc = pred[:, 4:(4 + nc)].amax(1) > conf_th
+    if redundancy:
+        nc = pred.shape[1] - 5
+    else:
+        nc = pred.shape[1] - 4  # number of classes
+
+
+
+    pred = pred.transpose(1,2)
+    # xc = pred[:, 4:(4 + nc)].amax(-1) > conf_th
+    xc = pred[..., 4:].amax(-1) > conf_th
+
 
     start_time = time.time()
     time_limit = 2.0 + 0.05 * bs
 
-    pred = pred.transpose(-1, -2)
+    # pred = pred.transpose(-1, -2)
     pred[..., :4] = wh2xy(pred[..., :4])
 
-    output = [torch.zeros((0, 6), device=pred.device)] * bs
+    out_dim = 7 if redundancy else 6
+    output = [torch.zeros((0, out_dim), device=pred.device) for _ in range(bs)]
+
     for xi, x in enumerate(pred):
         x = x[xc[xi]]
         if not x.shape[0]:
             continue
 
-        box, cls = x.split((4, nc), 1)
+        if redundancy:
+            box, cls, redundant = x.split((4, nc, 1), 1)
+        else:
+            box, cls = x.split((4, nc), 1)
 
         if nc > 1:
             i, j = torch.where(cls > conf_th)
-            x = torch.cat((box[i], x[i, 4 + j, None], j[:, None].float()), 1)
+            if redundancy:
+                # Add redundancy values to detections
+                x = torch.cat((box[i], cls[i, j, None], j[:, None].float(), redundant[i]), 1)
+            else:
+                x = torch.cat((box[i], cls[i, j, None], j[:, None].float()), 1)
+
         else:  # best class only
             conf, j = cls.max(1, keepdim=True)
-            x = torch.cat((box, conf, j.float()), 1)[conf.view(-1) > conf_th]
+            mask = conf.view(-1) > conf_th
+            if redundancy:
+                x = torch.cat((box, conf, j.float(), redundant), 1)[mask]
+            else:
+                x = torch.cat((box, conf, j.float()), 1)[mask]
 
         n = x.shape[0]  # number of boxes
         if not n:
@@ -546,6 +622,11 @@ def update_metrics(preds, batch, niou, iou_v, stats):
         cls = batch["cls"][idx]
         cls = cls.squeeze(-1)
 
+        redundant_gt = batch.get("redundant", None)
+        if redundant_gt is not None:
+            redundant_gt = redundant_gt[idx].squeeze(-1)
+
+
         if len(cls):
             img_shape = batch["img"].shape[2:]
             tensor = torch.tensor(img_shape).to(device)[[1, 0, 1, 0]]
@@ -571,8 +652,20 @@ def update_metrics(preds, batch, niou, iou_v, stats):
             iou = box_iou(box, output[:, :4])
             stat["tp"] = match_predictions(iou_v, output, cls, iou)
 
+            if redundant_gt is not None and output.shape[1] > 6:
+                matched_pred_idx = stat["tp"][:, 0].nonzero(as_tuple=True)[0]
+                if len(matched_pred_idx):
+                    matched_gt_idx = iou[:, matched_pred_idx].argmax(0)
+                    pred_redund = output[matched_pred_idx, -1]
+                    gt_redund = redundant_gt[matched_gt_idx]
+                    stats.setdefault("redund_pred", []).append(pred_redund.detach().cpu())
+                    stats.setdefault("redund_true", []).append(gt_redund.detach().cpu())
+
+            # -----------------------------------
+
         for k in stats.keys():
-            stats[k].append(stat[k])
+            if k in stat:
+                stats[k].append(stat[k])
     return stats
 
 

@@ -32,11 +32,9 @@ class Dataset(data.Dataset):
         filenames = os.listdir(f"{args.data_dir}/images/{self.mode}/")
         filenames = [os.path.join(f"{args.data_dir}/images/{self.mode}/", f) for f in filenames]
         self.images = self.load_image(filenames, from_txt=False)
-        print(len(self.images), "images found")
         self.labels = self.load_labels(args, self.images)["labels"]
 
         self.num_img = len(self.labels)
-        print(self.num_img, "images found for %s" % self.mode)
         self.indices = np.arange(self.num_img)
         self.transforms = self.build_transforms()
 
@@ -146,9 +144,18 @@ class Dataset(data.Dataset):
                         lb = np.array(lb, dtype=np.float32)
                     nl = len(lb)
                     if nl:
+                        if lb.shape[1] not in [5, 6]:
+                            raise ValueError(f"Labels require 5 or 6 columns, found {lb.shape[1]} columns")
+
                         assert lb.min() >= 0, f"negative label values {lb[lb < 0]}"
-                        assert lb.shape[
-                                   1] == 5, f"labels require 5 columns, {lb.shape[1]} columns detected"
+                        # assert lb.shape[
+                        #            1] == 5, f"labels require 5 columns, {lb.shape[1]} columns detected"
+                        if lb.shape[1] == 6:
+                            if lb.shape[1] == 6:
+                                sixth = lb[:, 5]
+                                uniq = np.unique(sixth)
+                                if not np.all(np.isin(uniq, [0.0, 1.0])):
+                                    raise ValueError(f"6th label column must contain only 0 or 1, found {uniq}")
                         assert lb[:,
                                1:].max() <= 1, f"non-normalized or out of bounds coordinates {lb[:, 1:][lb[:, 1:] > 1]}"
                         assert lb[:, 0].max() <= args.num_cls, (
@@ -161,14 +168,29 @@ class Dataset(data.Dataset):
                         lb = np.zeros((0, 5), dtype=np.float32)
                 else:
                     lb = np.zeros((0, 5), dtype=np.float32)
-                lb = lb[:, :5]
-                if img:
-                    cache["labels"].append({'image': img,
-                                            "shape": shape,
-                                            'cls': lb[:, 0:1],
-                                            'box': lb[:, 1:],
-                                            "norm": True,
-                                            "format": "xywh"})
+                # lb = lb[:, :5]
+
+                if lb.shape[1] == 5:
+                    if img:
+                        cache["labels"].append({'image': img,
+                                                "shape": shape,
+                                                'cls': lb[:, 0:1],
+                                                'box': lb[:, 1:],
+                                                "norm": True,
+                                                "format": "xywh"})
+
+                else:
+                    if img:
+                        cache["labels"].append({
+                            "image": img,
+                            "shape": shape,
+                            "cls": lb[:, 0:1],
+                            "box": lb[:, 1:5],
+                            "redundant": lb[:, 5:6],
+                            "norm": True,
+                            "format": "xywh"
+                        })
+
             except Exception as e:
                 print(f"Skipping file {img} due to error: {e}")
         torch.save(cache, path)
@@ -211,11 +233,26 @@ class Dataset(data.Dataset):
             value = values[i]
             if k == "img":
                 value = torch.stack(value, 0)
-            if k in {"cls", 'box'}:
-                value = torch.cat(value, 0)
+
+
+            # if k in {"cls", 'box'}:
+            #     value = torch.cat(value, 0)
+
+            # Merge label tensors across batch
+            if k in {"cls", "box", "redundant"}:
+                # some samples may not have 'redundant'
+                value = [v for v in value if v is not None]
+                if len(value):
+                    value = torch.cat(value, 0)
+                else:
+                    # ensure empty tensor for safety
+                    value = torch.zeros((0, 1), dtype=torch.float32)
+
+
             new_batch[k] = value
         new_batch["idx"] = list(new_batch["idx"])
         for i in range(len(new_batch["idx"])):
             new_batch["idx"][i] += i
         new_batch["idx"] = torch.cat(new_batch["idx"], 0)
         return new_batch
+    

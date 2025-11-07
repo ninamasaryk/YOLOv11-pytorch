@@ -444,6 +444,8 @@ class Format:
         h, w = img.shape[:2]
         cls = labels.pop("cls")
         instances = labels.pop("instances")
+        redundant = labels.pop("redundant", None)
+
         instances.convert_bbox(format=self.bbox_format)
         instances.denormalize(w, h)
         nl = len(instances)
@@ -454,7 +456,7 @@ class Format:
         img = img.transpose(2, 0, 1)
         img = np.ascontiguousarray(
             img[::-1] if random.uniform(0, 1) > self.bgr else img)
-        labels["img"] = torch.from_numpy(img)
+        labels["img"] = torch.from_numpy(img).float()
 
         labels["cls"] = torch.from_numpy(cls) if nl else torch.zeros(nl)
         labels["box"] = torch.from_numpy(
@@ -462,6 +464,21 @@ class Format:
         labels["box"][:, [0, 2]] /= w
         labels["box"][:, [1, 3]] /= h
         labels["idx"] = torch.zeros(nl)
+
+        if redundant is not None:
+            # Make sure redundant is a torch tensor and has correct shape
+            if isinstance(redundant, np.ndarray):
+                redundant = torch.from_numpy(redundant)
+            elif not isinstance(redundant, torch.Tensor):
+                redundant = torch.tensor(redundant)
+            if redundant.ndim == 1:
+                redundant = redundant.unsqueeze(1)
+            labels["redundant"] = redundant
+        # else:
+        #     # provide default empty tensor if missing
+        #     labels["redundant"] = torch.zeros((nl, 1), dtype=torch.float32)
+
+
         return labels
 
 

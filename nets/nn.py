@@ -198,13 +198,17 @@ class Detect(nn.Module):
     anchors = torch.empty(0)
     strides = torch.empty(0)
 
-    def __init__(self, nc=80, filters=()):
+    def __init__(self, nc=80, filters=(), params = None):
         super().__init__()
         self.nc = nc
         self.reg_max = 16
         self.nl = len(filters)
-        self.no = nc + self.reg_max * 4
+        self.no = nc + self.reg_max * 4 + (1 if params.redundancy else 0)
+        
         self.stride = torch.zeros(self.nl)
+
+        self.enable_redundant = params.redundancy
+        self.nr = 1 if self.enable_redundant else 0
 
         box = max((filters[0] // 4, 64))
         cls = max(filters[0], min(self.nc, 100))
@@ -219,13 +223,29 @@ class Detect(nn.Module):
                           nn.Sequential(DWConv(cls, cls, 3),
                                         Conv(cls, cls, 1)),
                           nn.Conv2d(cls, self.nc, 1), ) for x in filters)
+        
+        if self.enable_redundant:
+            self.redundant = nn.ModuleList(
+                nn.Sequential(
+                    nn.Sequential(DWConv(x, x, 3), Conv(x, cls, 1)),
+                    nn.Sequential(DWConv(cls, cls, 3), Conv(cls, cls, 1)),
+                    nn.Conv2d(cls, 1, 1),
+                ) for x in filters
+            )
+
+
         self.dfl = DFL(self.reg_max)
 
     def forward(self, x):
         for i in range(self.nl):
             box_out = self.box[i](x[i])
             cls_out = self.cls[i](x[i])
-            x[i] = torch.cat((box_out, cls_out), 1)
+
+            if self.enable_redundant:
+                redundant_out = self.redundant[i](x[i])
+                x[i] = torch.cat((box_out, cls_out, redundant_out), 1)
+            else:
+                x[i] = torch.cat((box_out, cls_out), 1)
 
         if self.training:
             return x
@@ -234,14 +254,31 @@ class Detect(nn.Module):
         x_cat = torch.cat([xi.view(bs[0], self.no, -1) for xi in x], 2)
         self.anchors, self.strides = (j.transpose(0, 1) for j in
                                       util.make_anchors(x, self.stride))
-        box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
+        
+       # Split predictions
+        if self.enable_redundant:
+            box, cls, redundant = x_cat.split((self.reg_max * 4, self.nc, self.nr), 1)
+        else:
+            box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
+            redundant = None
+
+
         lt, rb = self.dfl(box).chunk(2, 1)
         x1y1 = self.anchors.unsqueeze(0) - lt
         x2y2 = self.anchors.unsqueeze(0) + rb
         c_xy, wh = (x1y1 + x2y2) / 2, x2y2 - x1y1
         d_box = torch.cat((c_xy, wh), 1)
 
-        output = torch.cat((d_box * self.strides, cls.sigmoid()), 1)
+
+        # Scale box coordinates only
+        d_box = d_box * self.strides.unsqueeze(1)
+
+        # Sigmoid activations
+        if self.enable_redundant and redundant is not None:
+            output = torch.cat((d_box, cls.sigmoid(), redundant.sigmoid()), 1)
+        else:
+            output = torch.cat((d_box, cls.sigmoid()), 1)
+
         return output, x
 
     def bias_init(self):
@@ -332,23 +369,27 @@ def initialize_weights(model):
 
 
 class YOLO(torch.nn.Module):
-    def __init__(self, num_cls, width, depth, csp):
+    def __init__(self, num_cls, width, depth, csp, params):
         super().__init__()
+        self.params = params
+
         self.backbone = Backbone(width, depth, csp)
         self.head = Head(width, depth, csp)
 
         img_dummy = torch.zeros(1, width[0], 256, 256)
-        self.detect = Detect(num_cls, (width[3], width[4], width[5]))
-        self.detect.stride = torch.tensor(
-            [256 / x.shape[-2] for x in self.forward(img_dummy)])
+        self.detect = Detect(num_cls, (width[3], width[4], width[5]), params = self.params)
+        with torch.no_grad():
+            x_dummy = self.backbone(img_dummy)
+            x_dummy = self.head(x_dummy)
+        self.detect.stride = torch.tensor([256 / f.shape[-2] for f in x_dummy])
+        # self.detect.stride = torch.tensor(
+        #     [256 / x.shape[-2] for x in self.forward(img_dummy)])
         self.stride = self.detect.stride
         self.detect.bias_init()
         initialize_weights(self)
 
 
     def forward(self, x):
-        for i, t in enumerate(x):
-            print(f"  tensor[{i}].shape = {list(t.shape)}") 
         x = self.backbone(x)
         x = self.head(x)
         return self.detect(list(x))
@@ -362,38 +403,44 @@ class YOLO(torch.nn.Module):
         return self
 
 
-def yolo_v11_n(num_cls=80, num_channels=3):
+def yolo_v11_n(num_cls=80, num_channels=3, params = None):
     csp = [False, True]
     depth = [1, 1, 1, 1, 1]
     width = [num_channels, 16, 32, 64, 128, 256]
-    return YOLO(num_cls, width, depth, csp)
+    return YOLO(num_cls, width, depth, csp, params)
 
 
-def yolo_v11_s(num_cls=80, num_channels=3):
+def yolo_v11_s(num_cls=80, num_channels=3, params = None):
     csp = [False, True]
     depth = [1, 1, 1, 1, 1]
     width = [num_channels, 32, 64, 128, 256, 512]
 
-    return YOLO(num_cls, width, depth, csp)
+    return YOLO(num_cls, width, depth, csp, params)
 
 
-def yolo_v11_m(num_cls=80, num_channels=3):
+def yolo_v11_m(num_cls=80, num_channels=3, params = None):
     csp = [True, True]
     depth = [1, 1, 1, 1, 1]
     width = [num_channels, 64, 128, 256, 512, 512]
 
-    return YOLO(num_cls, width, depth, csp)
+    return YOLO(num_cls, width, depth, csp, params)
 
 
-def yolo_v11_l(num_cls=80, num_channels=3):
+def yolo_v11_l(num_cls=80, num_channels=3, params = None):
     csp = [True, True]
     depth = [2, 2, 2, 2, 2]
     width = [num_channels, 64, 128, 256, 512, 512]
-    return YOLO(num_cls, width, depth, csp)
+    return YOLO(num_cls, width, depth, csp, params)
 
 
-def yolo_v11_x(num_cls=80, num_channels=3):
+def yolo_v11_x(num_cls=80, num_channels=3, params = None):
     csp = [True, True]
     depth = [2, 2, 2, 2, 2]
     width = [num_channels, 96, 192, 384, 768, 768]
-    return YOLO(num_cls, width, depth, csp)
+    return YOLO(num_cls, width, depth, csp, params)
+
+
+def return_model_definition(model_name, num_classes, num_channels, params):
+    models = {'n':yolo_v11_n, 's': yolo_v11_s, 'm': yolo_v11_m, 'l': yolo_v11_l, 'x': yolo_v11_x}
+
+    return models[model_name](num_classes, num_channels, params)

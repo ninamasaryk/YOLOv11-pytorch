@@ -8,6 +8,7 @@ import torch
 import argparse
 import warnings
 import numpy as np
+from PIL import Image, ImageDraw
 from torch.utils import data
 from torch import distributed as dist
 from torch.nn.utils import clip_grad_norm_ as clip
@@ -20,9 +21,9 @@ from utils.dataset import Dataset
 
 def train(args, params):
     util.init_seeds()
-    model = nn.yolo_v11_x(args.num_cls, params['num_channels'])
-
-    ckpt = torch.load('yolo11x_remapped.pt', map_location='cpu')
+    device = params['device']
+    model = nn.return_model_definition(args.model_size, args.num_cls, params['num_channels'], args)
+    ckpt = torch.load(args.weights_path, map_location=device)
     state_dict = ckpt['model']
     
     # Keep only keys that match name AND shape
@@ -61,7 +62,7 @@ def train(args, params):
     # model.load_state_dict(new_state_dict, strict=False)
     # torch.save({"model": new_state_dict}, "yolo11_remapped.pt")
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
 
     if args.distributed:
@@ -107,7 +108,12 @@ def train(args, params):
 
     with open('weights/step.csv', 'w') as log:
         if args.rank == 0:
-            logger = csv.DictWriter(log, fieldnames=['epoch',
+            if args.redundancy:
+                logger = csv.DictWriter(log, fieldnames=['epoch',
+                                                     'box', 'cls', 'dfl', 'redundancy_loss',
+                                                'Recall', 'Precision', 'mAP@50', 'mAP'])
+            else:
+                logger = csv.DictWriter(log, fieldnames=['epoch',
                                                      'box', 'cls', 'dfl',
                                                      'Recall', 'Precision', 'mAP@50', 'mAP'])
             logger.writeheader()
@@ -125,7 +131,10 @@ def train(args, params):
                 loader.dataset.mosaic = False
 
             if args.rank == 0:
-                print("\n" + "%11s" * 5 % ("Epoch", "GPU", "box", "cls", "dfl"))
+                if args.redundancy:
+                    print("\n" + "%11s" * 6 % ("Epoch", "GPU", "box", "cls", "dfl", "rdt"))
+                else:
+                    print("\n" + "%11s" * 5 % ("Epoch", "GPU", "box", "cls", "dfl"))
                 p_bar = tqdm.tqdm(enumerate(loader), total=num_batch)
 
             t_loss = None
@@ -170,20 +179,38 @@ def train(args, params):
                         memory = f'{torch.cuda.memory_reserved() / 1e9:.3g}G'
                     else:
                         memory = '0G'  # or 'CPU' if you prefer
+                    if args.redundancy:
+                        fmt = fmt = "%11s%11s" + "%11.4g" * 4
                     p_bar.set_description(fmt % (f"{epoch + 1}/{args.epochs}", memory, *t_loss))
 
             if args.rank == 0:
-                m_pre, m_rec, map50, mean_map = validate(args, params, ema.ema)
-                box, cls, dfl = map(float, t_loss)
+                
+                if args.redundancy:
+                    m_pre, m_rec, map50, mean_map, acc, prec, recall, f1 = validate(args, params, ema.ema)
 
-                logger.writerow({'epoch': str(epoch + 1).zfill(3),
+                    box, cls, dfl, redundancy_loss = map(float, t_loss)
+                    logger.writerow({'epoch': str(epoch + 1).zfill(3),
                                  'box': str(f'{box:.3f}'),
                                  'cls': str(f'{cls:.3f}'),
                                  'dfl': str(f'{dfl:.3f}'),
+                                 'redundancy_loss': str(f'{redundancy_loss:.3f}'),
                                  'mAP': str(f'{mean_map:.3f}'),
                                  'mAP@50': str(f'{map50:.3f}'),
                                  'Recall': str(f'{m_rec:.3f}'),
                                  'Precision': str(f'{m_pre:.3f}')})
+                else:
+                    m_pre, m_rec, map50, mean_map, _, _, _, _ = validate(args, params, ema.ema)
+
+                    box, cls, dfl = map(float, t_loss)
+
+                    logger.writerow({'epoch': str(epoch + 1).zfill(3),
+                                    'box': str(f'{box:.3f}'),
+                                    'cls': str(f'{cls:.3f}'),
+                                    'dfl': str(f'{dfl:.3f}'),
+                                    'mAP': str(f'{mean_map:.3f}'),
+                                    'mAP@50': str(f'{map50:.3f}'),
+                                    'Recall': str(f'{m_rec:.3f}'),
+                                    'Precision': str(f'{m_pre:.3f}')})
                 log.flush()
 
                 ckpt = {'epoch': epoch+1, 'model': copy.deepcopy(ema.ema)}
@@ -211,6 +238,7 @@ def validate(args, params, model=None):
     n_iou = iou_v.numel()
 
     metric = {"tp": [], "conf": [], "pred_cls": [], "target_cls": [], "target_img": []}
+    redund_metrics = {"pred": [], "target": []}  # <-- NEW
 
     if not model:
         args.plot = True
@@ -227,12 +255,29 @@ def validate(args, params, model=None):
     for batch in tqdm.tqdm(loader, desc=('%10s' * 5) % (
     '', 'precision', 'recall', 'mAP50', 'mAP')):
         image = (batch["img"].to(device).float()) / 255
-        for k in ["idx", "cls", "box"]:
-            batch[k] = batch[k].to(device)
 
-        outputs = util.non_max_suppression(model(image))
+        if args.redundancy:
+            for k in ["idx", "cls", "box", "redundant"]:
+                batch[k] = batch[k].to(device)
+        else:
+            for k in ["idx", "cls", "box"]:
+                batch[k] = batch[k].to(device)
+
+        outputs = util.non_max_suppression(model(image), redundancy = args.redundancy)
 
         metric = util.update_metrics(outputs, batch, n_iou, iou_v, metric)
+
+        if args.redundancy and "redundant" in batch:
+            gt_redund = batch["redundant"].to(device).float().view(-1)
+            preds = []
+            for det in outputs:
+                if det.shape[0] and det.shape[1] >= 7:  # last col = redundancy score
+                    preds.append(det[:, -1])
+            if len(preds):
+                pred_redund = torch.cat(preds)
+                gt_trimmed = gt_redund[:len(pred_redund)]  # align counts
+                redund_metrics["pred"].append(pred_redund.cpu())
+                redund_metrics["target"].append(gt_trimmed.cpu())
 
     stats = {k: torch.cat(v, 0).cpu().numpy() for k, v in metric.items()}
     stats.pop("target_img", None)
@@ -254,107 +299,123 @@ def validate(args, params, model=None):
 
     print(('%10s' + '%10.3g' * 4) % ('', m_pre, m_rec, map50, mean_ap))
 
+    if "redund_pred" in metric and len(metric["redund_pred"]):
+        y_pred = torch.cat(metric["redund_pred"])
+        y_true = torch.cat(metric["redund_true"])
+        y_bin = (y_pred > 0.5).float()
+
+        acc = (y_bin == y_true).float().mean().item()
+        tp = ((y_bin == 1) & (y_true == 1)).sum().item()
+        fp = ((y_bin == 1) & (y_true == 0)).sum().item()
+        fn = ((y_bin == 0) & (y_true == 1)).sum().item()
+
+        prec = tp / (tp + fp + 1e-9)
+        rec = tp / (tp + fn + 1e-9)
+        f1 = 2 * prec * rec / (prec + rec + 1e-9)
+
+        print(f"Redundancy  Acc: {acc:.3f}  Prec: {prec:.3f}  Rec: {rec:.3f}  F1: {f1:.3f}")
+    else:
+        acc = prec = rec = f1 = 0.0
+
     model.float()
-    return m_pre, m_rec, map50, mean_ap
+
+    return m_pre, m_rec, map50, mean_ap, acc, prec, rec, f1
 
 @torch.no_grad()
 def inference(args, params):
     #TODO: refactor to work with input with more channels and actual input
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = torch.load('./weights/v11_m.pt', device)['model'].float()
-    model.half()
+    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    model = model = nn.return_model_definition(args.model_size, args.num_cls, params['num_channels'], args)
+    ckpt = torch.load('yolo11x_remapped.pt', map_location=device)
+
+    state_dict = ckpt['model']
+
+        # Keep only keys that match name AND shape
+    filtered_state = {}
+    for k, v in state_dict.items():
+        if k in model.state_dict():
+            if v.shape == model.state_dict()[k].shape:
+                filtered_state[k] = v
+            else:
+                print(f"⚠️ Skipping {k}: shape mismatch {v.shape} vs {model.state_dict()[k].shape}")
+        else:
+            print(f"❌ Skipping {k}: not in current model")
+
+    # Update only the compatible parameters
+    missing, unexpected = model.load_state_dict(filtered_state, strict=False)
+    print("Missing keys:", missing)
+    print("Unexpected keys:", unexpected)
+    print(f"✅ Loaded {len(filtered_state)} / {len(model.state_dict())} compatible layers")
+
+    # with torch.no_grad():
+    #     w = state_dict["backbone.p1.0.conv.weight"]  # old input conv weights
+    #     new_w = model.state_dict()["backbone.p1.0.conv.weight"]   # new shape (out, 33, h, w)
+
+    #     # e.g., repeat RGB weights across 33 channels
+    #     repeat_factor = new_w.shape[1] // w.shape[1]
+    #     new_w[:, :w.shape[1]*repeat_factor] = w.repeat(1, repeat_factor, 1, 1)
+    #     model.state_dict()["backbone.p1.0.conv.weight"] = new_w
+
+    model.to(device)
     model.eval()
-    camera = cv2.VideoCapture('2.mp4')
+    dataset = Dataset(args, params, False)
+    loader = data.DataLoader(dataset, batch_size=16,
+                             shuffle=False, num_workers=4,
+                             pin_memory=True, collate_fn=Dataset.collate_fn)
 
-    # Get video properties
-    width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = camera.get(cv2.CAP_PROP_FPS)
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Define the codec
-    out = cv2.VideoWriter('output2.mp4', fourcc, fps, (width, height))
+    for batch in tqdm.tqdm(loader, desc=('%10s' * 5) % (
+    '', 'precision', 'recall', 'mAP50', 'mAP')):
+        image = (batch["img"].to(device).float()) / 255
+        for k in ["idx", "cls", "box"]:
+            batch[k] = batch[k].to(device)
+        shape = image.shape[2:]
+        height, width = image.shape[2:]
 
-    if not camera.isOpened():
-        print("Error opening video stream or file")
+        outputs, _ = model(image)
 
-    while camera.isOpened():
-        success, frame = camera.read()
-        if success:
-            image = frame.copy()
-            shape = image.shape[:2]
+        # NMS
+        batch_outputs = util.non_max_suppression(outputs, 0.15, 0.2, redundancy = args.redundancy)
+       
+        for det, img, filename in zip(batch_outputs, image, batch['image']):
+            img_to_draw = (img.cpu().numpy()*255).astype(np.uint8)
+            pil_img = Image.fromarray(img_to_draw.transpose(1, 2, 0))
+            draw = ImageDraw.Draw(pil_img)
 
-            r = args.inp_size / max(shape[0], shape[1])
-            if r != 1:
-                resample = cv2.INTER_LINEAR if r > 1 else cv2.INTER_AREA
-                image = cv2.resize(image, dsize=(int(shape[1] * r), int(shape[0] * r)), interpolation=resample)
-            height, width = image.shape[:2]
+            if det is not None:
+                det[:, :4] /= min(height / shape[0], width / shape[1])
 
-            # Scale ratio (new / old)
-            r = min(1.0, args.inp_size / height, args.inp_size / width)
+                det[:, 0].clamp_(0, shape[1])
+                det[:, 1].clamp_(0, shape[0])
+                det[:, 2].clamp_(0, shape[1])
+                det[:, 3].clamp_(0, shape[0])
 
-            # Compute padding
-            pad = int(round(width * r)), int(round(height * r))
-            w = (args.inp_size - pad[0]) / 2
-            h = (args.inp_size - pad[1]) / 2
-
-            if (width, height) != pad:  # resize
-                image = cv2.resize(image, pad, interpolation=cv2.INTER_LINEAR)
-            top, bottom = int(round(h - 0.1)), int(round(h + 0.1))
-            left, right = int(round(w - 0.1)), int(round(w + 0.1))
-            image = cv2.copyMakeBorder(image, top, bottom, left, right, cv2.BORDER_CONSTANT)
-
-            # Convert HWC to CHW, BGR to RGB
-            x = image.transpose((2, 0, 1))[::-1]
-            x = np.ascontiguousarray(x)
-            x = torch.from_numpy(x)
-            x = x.unsqueeze(dim=0)
-            x = x.to(device)
-            x = x.half()
-            x = x / 255
-            # Inference
-            outputs = model(x)
-            # NMS
-            outputs = util.non_max_suppression(outputs, 0.15, 0.2)[0]
-
-            if outputs is not None:
-                outputs[:, [0, 2]] -= w
-                outputs[:, [1, 3]] -= h
-                outputs[:, :4] /= min(height / shape[0], width / shape[1])
-
-                outputs[:, 0].clamp_(0, shape[1])
-                outputs[:, 1].clamp_(0, shape[0])
-                outputs[:, 2].clamp_(0, shape[1])
-                outputs[:, 3].clamp_(0, shape[0])
-
-                for box in outputs:
+                for box in det:
                     box = box.cpu().numpy()
                     x1, y1, x2, y2, score, index = box
                     class_name = params['names'][int(index)]
                     label = f"{class_name} {score:.2f}"
-                    util.draw_box(frame, box, index, label)
-
-            cv2.imshow('Frame', frame)
-            out.write(frame)
-            if cv2.waitKey(25) & 0xFF == ord('q'):
-                break
-        else:
-            break
-    camera.release()
-    out.release()
-    cv2.destroyAllWindows()
+                    
+                    util.draw_box(img_to_draw, box, index, label)
+                    draw.rectangle([int(x1), int(y1), int(x2), int(y2)], outline=(255, 0, 0), width=2)
+                pil_img.save(f"./{filename.split('/')[-1].split('.')[0]}.png")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--rank', default=0, type=int)
     parser.add_argument('--epochs', default=2, type=int)
-    parser.add_argument('--num-cls', type=int, default=1)
+    parser.add_argument('--num-cls', type=int, default=5)
     parser.add_argument('--inp-size', type=int, default=640)
     parser.add_argument('--batch-size', type=int, default=2)
-    parser.add_argument('--data-dir', type=str, default='/Users/ninamasarykova/Documents/FIIT_STU/DizP/CooperativePerception/dataset_rgb')
+    parser.add_argument('--data-dir', type=str, default='/Users/ninamasarykova/Documents/FIIT_STU/DizP/CooperativePerception/dataset_occupancy')
     parser.add_argument('--plot', action='store_true')
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--validate', action='store_true')
     parser.add_argument('--inference', action='store_true')
+    parser.add_argument('--redundancy', action=argparse.BooleanOptionalAction)
+    parser.add_argument('--weights_path', default='yolo11x_remapped.pt', type=str)
+    parser.add_argument('--model_size', default='x', type=str)
 
     args = parser.parse_args()
 
@@ -365,6 +426,8 @@ def main():
     with open('utils/args.yaml', errors='ignore') as f:
         params = yaml.safe_load(f)
 
+    device = torch.device("cpu") #torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    params['device']=device
 
     if args.train:
         train(args, params)
