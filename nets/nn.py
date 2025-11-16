@@ -288,9 +288,66 @@ class Detect(nn.Module):
             b[-1].bias.data[: m.nc] = math.log(5 / m.nc / (640 / s) ** 2)
 
 
-class Backbone(nn.Module):
-    def __init__(self, width, depth, csp):
+
+class MaskEncoder(nn.Module):
+    def __init__(self, in_ch=2, base_ch=32, out_ch=128):
         super().__init__()
+        self.enc = nn.Sequential(
+            # /2
+            nn.Conv2d(in_ch, in_ch, 3, 2, 1, groups=in_ch),
+            nn.Conv2d(in_ch, base_ch, 1),
+            nn.ReLU(inplace=True),
+
+            # /4
+            nn.Conv2d(base_ch, base_ch, 3, 2, 1, groups=base_ch),
+            nn.Conv2d(base_ch, base_ch * 2, 1),
+            nn.ReLU(inplace=True),
+
+            # /8
+            nn.Conv2d(base_ch * 2, base_ch * 2, 3, 2, 1, groups=base_ch * 2),
+            nn.Conv2d(base_ch * 2, base_ch * 4, 1),
+            nn.ReLU(inplace=True),
+
+            # /16 — add one more stride-2 depthwise conv
+            nn.Conv2d(base_ch * 4, base_ch * 4, 3, 2, 1, groups=base_ch * 4),
+            nn.Conv2d(base_ch * 4, out_ch, 1),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.enc(x)
+    
+
+class GroupedFusion(nn.Module):
+    def __init__(self, rgb_ch: int, mask_ch: int):
+        super().__init__()
+        latent_ch = rgb_ch // 2   # fuse in half-dimension latent space
+
+        # 1️⃣ Project RGB + Mask to latent width
+        self.rgb_reduce  = nn.Conv2d(rgb_ch, latent_ch, 1, 1, 0, bias=False)
+        self.mask_align  = nn.Conv2d(mask_ch, latent_ch, 1, 1, 0, bias=False)
+
+        # 2️⃣ Compress back to rgb_ch after fusion
+        self.compress = nn.Conv2d(2 * latent_ch, rgb_ch, 1, 1, 0, groups=2, bias=False)
+
+        # 3️⃣ Normalize + activate
+        self.bn = nn.BatchNorm2d(rgb_ch)
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, rgb, mask):
+        # Assume mask and rgb already have same spatial size (no interpolation!)
+        rgb_latent  = self.rgb_reduce(rgb)
+        mask_latent = self.mask_align(mask)
+        fused = torch.cat([rgb_latent, mask_latent], dim=1)  # [B, rgb_ch, H, W]
+        fused = self.compress(fused)
+        return self.act(self.bn(fused))
+
+
+class Backbone(nn.Module):
+    def __init__(self, width, depth, csp, params):
+        super().__init__()
+
+        self.params = params
 
         self.p1 = []
         self.p2 = []
@@ -320,11 +377,28 @@ class Backbone(nn.Module):
         self.p4 = nn.Sequential(*self.p4)
         self.p5 = nn.Sequential(*self.p5)
 
+        if params.fusion:
+            self.mask_encoder = MaskEncoder(in_ch=2, base_ch=32, out_ch=128)
+            self.fusion = GroupedFusion(rgb_ch=width[4], mask_ch=128)
+
     def forward(self, x):
+
+        if self.params.fusion:
+            rgb = x[:, :3, :, :]
+            mask = x[:, 3:, :, :]
+            x = rgb
+
         p1 = self.p1(x)
         p2 = self.p2(p1)
         p3 = self.p3(p2)
         p4 = self.p4(p3)
+            # Process mask branch
+        if self.params.fusion:
+            mask_feat = self.mask_encoder(mask)
+
+            # Fuse cooperative info
+            p4 = self.fusion(p4, mask_feat)
+
         p5 = self.p5(p4)
         return p3, p4, p5
 
@@ -373,10 +447,13 @@ class YOLO(torch.nn.Module):
         super().__init__()
         self.params = params
 
-        self.backbone = Backbone(width, depth, csp)
+        self.backbone = Backbone(width, depth, csp, params = self.params)
         self.head = Head(width, depth, csp)
 
-        img_dummy = torch.zeros(1, width[0], 256, 256)
+        dummy_width = width[0]
+        if params.fusion:
+            dummy_width+=params.num_masks
+        img_dummy = torch.zeros(1, dummy_width, 256, 256)
         self.detect = Detect(num_cls, (width[3], width[4], width[5]), params = self.params)
         with torch.no_grad():
             x_dummy = self.backbone(img_dummy)
@@ -404,6 +481,8 @@ class YOLO(torch.nn.Module):
 
 
 def yolo_v11_n(num_cls=80, num_channels=3, params = None):
+    if params.fusion:
+        num_channels = num_channels - params.num_masks
     csp = [False, True]
     depth = [1, 1, 1, 1, 1]
     width = [num_channels, 16, 32, 64, 128, 256]
@@ -411,6 +490,8 @@ def yolo_v11_n(num_cls=80, num_channels=3, params = None):
 
 
 def yolo_v11_s(num_cls=80, num_channels=3, params = None):
+    if params.fusion:
+        num_channels = num_channels - params.num_masks
     csp = [False, True]
     depth = [1, 1, 1, 1, 1]
     width = [num_channels, 32, 64, 128, 256, 512]
@@ -419,6 +500,8 @@ def yolo_v11_s(num_cls=80, num_channels=3, params = None):
 
 
 def yolo_v11_m(num_cls=80, num_channels=3, params = None):
+    if params.fusion:
+        num_channels = num_channels - params.num_masks
     csp = [True, True]
     depth = [1, 1, 1, 1, 1]
     width = [num_channels, 64, 128, 256, 512, 512]
@@ -427,6 +510,8 @@ def yolo_v11_m(num_cls=80, num_channels=3, params = None):
 
 
 def yolo_v11_l(num_cls=80, num_channels=3, params = None):
+    if params.fusion:
+        num_channels = num_channels - params.num_masks
     csp = [True, True]
     depth = [2, 2, 2, 2, 2]
     width = [num_channels, 64, 128, 256, 512, 512]
@@ -434,6 +519,8 @@ def yolo_v11_l(num_cls=80, num_channels=3, params = None):
 
 
 def yolo_v11_x(num_cls=80, num_channels=3, params = None):
+    if params.fusion:
+        num_channels = num_channels - params.num_masks
     csp = [True, True]
     depth = [2, 2, 2, 2, 2]
     width = [num_channels, 96, 192, 384, 768, 768]

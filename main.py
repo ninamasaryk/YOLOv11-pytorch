@@ -406,6 +406,7 @@ def main():
     parser.add_argument('--rank', default=0, type=int)
     parser.add_argument('--epochs', default=2, type=int)
     parser.add_argument('--num-cls', type=int, default=5)
+    parser.add_argument('--num-masks', type=int, default=2)
     parser.add_argument('--inp-size', type=int, default=640)
     parser.add_argument('--batch-size', type=int, default=2)
     parser.add_argument('--data-dir', type=str, default='/Users/ninamasarykova/Documents/FIIT_STU/DizP/CooperativePerception/dataset_occupancy')
@@ -414,6 +415,7 @@ def main():
     parser.add_argument('--validate', action='store_true')
     parser.add_argument('--inference', action='store_true')
     parser.add_argument('--redundancy', action=argparse.BooleanOptionalAction)
+    parser.add_argument('--fusion', action=argparse.BooleanOptionalAction)
     parser.add_argument('--weights_path', default='yolo11x_remapped.pt', type=str)
     parser.add_argument('--model_size', default='x', type=str)
 
