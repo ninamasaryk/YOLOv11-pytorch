@@ -118,7 +118,7 @@ class Dataset(data.Dataset):
         
         path = Path(labels[0]).parent.with_suffix(".cache")
         if os.path.exists(path):
-            return torch.load(path)
+            return torch.load(path, weights_only=False)
 
         for img, label in zip(images, labels):
             try:
@@ -165,11 +165,17 @@ class Dataset(data.Dataset):
                         if len(i) < nl:  # duplicate row check
                             lb = lb[i]  # remove duplicates
                     else:
-                        lb = np.zeros((0, 5), dtype=np.float32)
+                        if args.redundancy:
+                            lb = np.zeros((0, 6), dtype=np.float32)
+                        else:
+                            lb = np.zeros((0, 5), dtype=np.float32)
                 else:
-                    lb = np.zeros((0, 5), dtype=np.float32)
+                    if args.redundancy:
+                        lb = np.zeros((0, 6), dtype=np.float32)
+                    else:
+                        lb = np.zeros((0, 5), dtype=np.float32)
                 # lb = lb[:, :5]
-
+                
                 if lb.shape[1] == 5:
                     if img:
                         cache["labels"].append({'image': img,
@@ -178,7 +184,6 @@ class Dataset(data.Dataset):
                                                 'box': lb[:, 1:],
                                                 "norm": True,
                                                 "format": "xywh"})
-
                 else:
                     if img:
                         cache["labels"].append({

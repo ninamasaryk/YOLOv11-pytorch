@@ -45,8 +45,12 @@ class Mosaic:
             h, w = labels_patch.pop("new_shape")
 
             if i == 0:  # top left
-                img4 = np.full((self.s * 2, self.s * 2, img.shape[2]), 114,
-                               dtype=np.uint8)
+                if img.shape[2] == 5:
+                    fill_values = np.array([114/255,114/255,114/255,0,0], dtype=img.dtype)[:img.shape[2]]
+                    img4 = np.ones((self.s * 2, self.s * 2, img.shape[2]), dtype=img.dtype) * fill_values
+                else:
+                    img4 = np.full((self.s * 2, self.s * 2, img.shape[2]), 114/255,
+                                dtype=img.dtype)
                 x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc
                 x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h
             elif i == 1:  # top right
@@ -111,7 +115,7 @@ class RandomPerspective:
         self.pre_transform = pre_transform
 
     def affine_transform(self, img, border):
-        val = (114, 114, 114)
+        val = (114/255, 114/255, 114/255)
         # Center
         center = np.eye(3, dtype=np.float32)
 
@@ -150,12 +154,23 @@ class RandomPerspective:
 
         #TODO: refactor to work with more channels
         if (border[0] != 0) or (border[1] != 0) or (matrix != np.eye(3)).any():
-            if _pers:
-                img = cv2.warpPerspective(img, matrix, dsize=self.size,
-                                          borderValue=(114, 114, 114))
-            else:  # affine
-                img = cv2.warpAffine(img, matrix[:2], dsize=self.size,
-                                     borderValue=(114, 114, 114))
+
+            if img.ndim == 3 and img.shape[2] > 3:
+                img_new = np.zeros_like(img)
+                for c in range(img.shape[2]):
+                    border = 114/255 if c < 3 else 0
+                    if _pers:
+                        img_new[..., c] = cv2.warpPerspective(img[..., c], matrix, dsize=self.size, borderValue=border)
+                    else:
+                        img_new[..., c] = cv2.warpAffine(img[..., c], matrix[:2], dsize=self.size, borderValue=border)
+                img = img_new
+            else:
+                if _pers:
+                    img = cv2.warpPerspective(img, matrix, dsize=self.size,
+                                            borderValue=(114/255, 114/255, 114/255))
+                else:  # affine
+                    img = cv2.warpAffine(img, matrix[:2], dsize=self.size,
+                                        borderValue=(114/255, 114/255, 114/255))
 
         return img, matrix, s
 
@@ -272,12 +287,18 @@ class LetterBox:
         if img.shape[2] == 3:
             img = cv2.copyMakeBorder(
                 img, top, bottom, left, right, cv2.BORDER_CONSTANT,
-                value=(114, 114, 114)
+                value=(114/255, 114/255, 114/255)
             )  # add border
         else:
-            border_value = tuple([114] * img.shape[-1])  # Create border value for all channels
+            if img.shape[2]==5:
+                fill_values = np.array([114/255, 114/255, 114/255, 0, 0], dtype=img.dtype)
+                border_value = tuple(fill_values.tolist())
+            else:
+                assert img.shape[2] in [3,5], 'Shape not correct in LetterBox'
             padded_shape = (img.shape[0] + top + bottom, img.shape[1] + left + right) + img.shape[2:]
-            padded_img = np.full(padded_shape, border_value[0], dtype=img.dtype)
+            padded_img = np.zeros(padded_shape)
+            for c in range(img.shape[2]):
+                padded_img[..., c] = border_value[c]
             padded_img[top:top+img.shape[0], left:left+img.shape[1]] = img
             img = padded_img
 
@@ -320,7 +341,7 @@ class Albumentations:
         if self.transform is None or random.random() > 0:
             return labels
 
-        labels["img"] = self.transform(image=labels["img"])["image"]
+        labels["img"][:,:,:3] = self.transform(image=labels["img"][:,:,:3])["image"]
         return labels
 
 
@@ -454,8 +475,8 @@ class Format:
             img = np.expand_dims(img, -1)
 
         img = img.transpose(2, 0, 1)
-        img = np.ascontiguousarray(
-            img[::-1] if random.uniform(0, 1) > self.bgr else img)
+        # img = np.ascontiguousarray(
+        #     img[::-1] if random.uniform(0, 1) > self.bgr else img)
         labels["img"] = torch.from_numpy(img).float()
 
         labels["cls"] = torch.from_numpy(cls) if nl else torch.zeros(nl)

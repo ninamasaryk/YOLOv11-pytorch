@@ -228,11 +228,11 @@ class Assigner(nn.Module):
 
         if n_max_boxes == 0:
             return (
-                torch.full_like(score[..., 0], self.nc),
+                # torch.full_like(score[..., 0], self.nc),
                 torch.zeros_like(p_box),
                 torch.zeros_like(score),
-                torch.zeros_like(score[..., 0]),
-                torch.zeros_like(score[..., 0]))
+                torch.zeros_like(score[..., 0], dtype=torch.bool),
+                torch.full(score[..., 0].shape, -1))
 
         lt, rb = gt_box.view(-1, 1, 4).chunk(2, 2)
         box_delta = torch.cat((anchors[None] - lt, rb - anchors[None]), dim=2)
@@ -420,10 +420,13 @@ class DetectionLoss:
 
                 valid = assigned_gt < gt_redund_img.shape[0]
                 if valid.any():
-                    target_redundant[b, pos_mask.nonzero(as_tuple=True)[0][valid], 0] = gt_redund_img[assigned_gt[valid]]
+                    target_redundant[b, pos_mask.nonzero(as_tuple=True)[0][valid], 0] = gt_redund_img[assigned_gt[valid]].to(target_redundant.dtype)
 
             # ✅ compute loss only on positive anchors (objects)
-            redund_loss = self.bce(pred_redundant[fg_mask], target_redundant[fg_mask]).mean()
+            if fg_mask.any():
+                redund_loss = self.bce(pred_redundant[fg_mask], target_redundant[fg_mask]).mean()
+            else:
+                redund_loss = torch.tensor(0.0, device=self.device)
         
         
 

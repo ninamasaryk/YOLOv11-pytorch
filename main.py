@@ -97,7 +97,9 @@ def train(args, params):
     linear = lambda x: (max(1 - x / args.epochs, 0) * (1.0 - 0.01) + 0.01)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=linear)
     scheduler.last_epoch = - 1
-    criterion = util.DetectionLoss(model)
+    # criterion = util.DetectionLoss(model)
+    criterion = util.DetectionLoss(model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model)
+
 
 
     opt_step = -1
@@ -151,7 +153,9 @@ def train(args, params):
                             x["momentum"] = np.interp(glob_step, xi, [0.8, 0.937])
 
                 
-                images = batch["img"].to(device).float() / 255
+                images = batch["img"].to(device).float()
+
+
                 # Use autocast only when CUDA is available; when disabled it's a no-op
                 with torch.amp.autocast(device_type=device.type, enabled=(device.type == 'cuda')):
                     pred = model(images)
@@ -214,7 +218,7 @@ def train(args, params):
                 log.flush()
 
                 ckpt = {'epoch': epoch+1, 'model': copy.deepcopy(ema.ema)}
-                torch.save(ckpt, 'weights/last.pt')
+                torch.save(ckpt, f'weights/epoch_{epoch+1}.pt')
 
                 if mean_map > best_map:
                     best_map = mean_map
@@ -254,7 +258,7 @@ def validate(args, params, model=None):
 
     for batch in tqdm.tqdm(loader, desc=('%10s' * 5) % (
     '', 'precision', 'recall', 'mAP50', 'mAP')):
-        image = (batch["img"].to(device).float()) / 255
+        image = (batch["img"].to(device).float())
 
         if args.redundancy:
             for k in ["idx", "cls", "box", "redundant"]:
@@ -302,6 +306,11 @@ def validate(args, params, model=None):
     if "redund_pred" in metric and len(metric["redund_pred"]):
         y_pred = torch.cat(metric["redund_pred"])
         y_true = torch.cat(metric["redund_true"])
+
+        print("Mean y_pred:", y_pred.mean().item())
+        print("Fraction of positives in truth:", (y_true > 0.5).float().mean().item())
+        print("Fraction of predicted positives:", (y_pred > 0.5).float().mean().item())
+
         y_bin = (y_pred > 0.5).float()
 
         acc = (y_bin == y_true).float().mean().item()
@@ -366,7 +375,8 @@ def inference(args, params):
 
     for batch in tqdm.tqdm(loader, desc=('%10s' * 5) % (
     '', 'precision', 'recall', 'mAP50', 'mAP')):
-        image = (batch["img"].to(device).float()) / 255
+        image = (batch["img"].to(device).float())
+
         for k in ["idx", "cls", "box"]:
             batch[k] = batch[k].to(device)
         shape = image.shape[2:]
@@ -404,11 +414,11 @@ def inference(args, params):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--rank', default=0, type=int)
-    parser.add_argument('--epochs', default=2, type=int)
-    parser.add_argument('--num-cls', type=int, default=5)
+    parser.add_argument('--epochs', default=20, type=int)
+    parser.add_argument('--num-cls', type=int, default=4)
     parser.add_argument('--num-masks', type=int, default=2)
     parser.add_argument('--inp-size', type=int, default=640)
-    parser.add_argument('--batch-size', type=int, default=2)
+    parser.add_argument('--batch-size', type=int, default=16)
     parser.add_argument('--data-dir', type=str, default='/Users/ninamasarykova/Documents/FIIT_STU/DizP/CooperativePerception/dataset_occupancy')
     parser.add_argument('--plot', action='store_true')
     parser.add_argument('--train', action='store_true')
@@ -418,9 +428,11 @@ def main():
     parser.add_argument('--fusion', action=argparse.BooleanOptionalAction)
     parser.add_argument('--weights_path', default='yolo11x_remapped.pt', type=str)
     parser.add_argument('--model_size', default='x', type=str)
+    parser.add_argument('--local-rank', type=int, default=0)
 
     args = parser.parse_args()
 
+    args.local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
     args.rank = int(os.environ.get("RANK", 0))
     args.world_size = int(os.getenv('WORLD_SIZE', 1))
     args.distributed = int(os.getenv('WORLD_SIZE', 1)) > 1
@@ -428,7 +440,10 @@ def main():
     with open('utils/args.yaml', errors='ignore') as f:
         params = yaml.safe_load(f)
 
-    device = torch.device("cpu") #torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{args.local_rank}")
+    else:
+        device = torch.device("cpu")
     params['device']=device
 
     if args.train:
